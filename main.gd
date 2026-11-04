@@ -1,11 +1,10 @@
-extends Node2D
-## ฟาร์มสุขใจ — เกมฟาร์มไอโซเมตริกสไตล์การ์ตูน (ภาพทุกอย่างวาดด้วยโค้ด)
+extends Node3D
+## ฟาร์มสุขใจ — ฟาร์ม 3D สไตล์การ์ตูนลอวโพล (โมเดลทุกชิ้นสร้างจากโค้ด ไม่มีไฟล์โมเดล)
 
-const TW := 88.0
-const TH := 44.0
 const MAXN := 9
-const ORIGIN := Vector2(470, 125)
+const CENTER := 4.0
 const FONT_PATH := "res://fonts/Sarabun-Bold.ttf"
+const CIDX := {"": 0, "wheat": 1, "carrot": 2, "strawberry": 3, "corn": 4, "pumpkin": 5}
 
 var CROP_COL := {
 	"wheat": Color("e8c547"), "carrot": Color("ff8c1a"), "strawberry": Color("e8334a"),
@@ -17,6 +16,7 @@ var KIND_COL := {
 
 var font: Font
 var tiles: Array = []
+var tile_nodes: Array = []
 var tool_mode := "plant"
 var seed_kind := "wheat"
 var hover := Vector2i(-1, -1)
@@ -25,6 +25,13 @@ var last_tile := Vector2i(-1, -1)
 var t := 0.0
 var floats: Array = []
 var _sync_t := 0.0
+var _mats := {}
+var cam: Camera3D
+var sun: DirectionalLight3D
+var env: Environment
+var hover_mesh: MeshInstance3D
+var buyer_nodes := {}
+var chickens: Array = []
 
 # UI refs
 var root_ui: Control
@@ -49,12 +56,15 @@ func _ready() -> void:
 	if ResourceLoader.exists(FONT_PATH):
 		font = load(FONT_PATH) as Font
 	_init_tiles()
+	_build_world()
 	_build_ui()
 	Eco.changed.connect(_on_eco_changed)
 	Eco.buyers_changed.connect(_rebuild_buyers)
+	Eco.buyers_changed.connect(_rebuild_buyers3d)
 	Eco.message.connect(_toast)
 	_on_eco_changed()
 	_rebuild_buyers()
+	_rebuild_buyers3d()
 
 # =====================================================================
 #  ข้อมูลแปลง
@@ -89,18 +99,21 @@ func _notification(what: int) -> void:
 		_sync_tiles()
 		Eco.save_game()
 
-func tile_center(x: int, y: int) -> Vector2:
-	return ORIGIN + Vector2((x - y) * TW / 2.0, (x + y) * TH / 2.0)
-
-func screen_to_tile(p: Vector2) -> Vector2i:
-	var d := p - ORIGIN
-	var gx := (d.x / (TW / 2.0) + d.y / (TH / 2.0)) / 2.0
-	var gy := (d.y / (TH / 2.0) - d.x / (TW / 2.0)) / 2.0
-	return Vector2i(roundi(gx), roundi(gy))
+func tile_world(c: Vector2i) -> Vector3:
+	return Vector3(c.x - CENTER, 0.0, c.y - CENTER)
 
 func _in_land(c: Vector2i) -> bool:
 	var n := Eco.land_size()
 	return c.x >= 0 and c.y >= 0 and c.x < n and c.y < n
+
+func _ground(sp: Vector2) -> Vector2i:
+	var from := cam.project_ray_origin(sp)
+	var dir := cam.project_ray_normal(sp)
+	var hit = Plane(Vector3.UP, 0.0).intersects_ray(from, dir)
+	if hit == null:
+		return Vector2i(-1, -1)
+	var p: Vector3 = hit
+	return Vector2i(floori(p.x + CENTER + 0.5), floori(p.z + CENTER + 0.5))
 
 # =====================================================================
 #  อินพุต + ลอจิก
@@ -110,21 +123,21 @@ func _unhandled_input(e: InputEvent) -> void:
 		dragging = e.pressed
 		if e.pressed:
 			last_tile = Vector2i(-1, -1)
-			_act_at(get_global_mouse_position())
+			_act_at(e.position)
 	elif e is InputEventMouseMotion:
-		hover = screen_to_tile(get_global_mouse_position())
+		hover = _ground(e.position)
 		if dragging:
-			_act_at(get_global_mouse_position())
+			_act_at(e.position)
 
-func _act_at(p: Vector2) -> void:
-	if p.y > 604.0 or p.x > 880.0:
+func _act_at(sp: Vector2) -> void:
+	if sp.y > 604.0 or sp.x > 880.0:
 		return
-	var c := screen_to_tile(p)
+	var c := _ground(sp)
 	if not _in_land(c) or c == last_tile:
 		return
 	last_tile = c
 	var tl: Dictionary = tiles[c.y][c.x]
-	var pos := tile_center(c.x, c.y)
+	var pos := tile_world(c)
 	match tool_mode:
 		"till":
 			if tl["s"] == 0:
@@ -164,11 +177,13 @@ func _act_at(p: Vector2) -> void:
 				tl["g"] = 0.0
 				_float(pos, "+%d %s" % [amount, Eco.CROPS[k]["name"]], Color("fff7a8"))
 
-func _float(p: Vector2, txt: String, col: Color) -> void:
-	floats.append({"p": p + Vector2(0, -20), "txt": txt, "t": 0.0, "col": col})
+func _float(p: Vector3, txt: String, col: Color) -> void:
+	var l := label3d(self, txt, p + Vector3(0, 0.9, 0), 44, col, 0.012)
+	floats.append({"n": l, "t": 0.0, "col": col, "p": l.position})
 
 func _process(delta: float) -> void:
 	t += delta
+	# การเติบโตของพืช
 	for y in MAXN:
 		for x in MAXN:
 			var tl: Dictionary = tiles[y][x]
@@ -179,293 +194,586 @@ func _process(delta: float) -> void:
 				if tl["w"] <= 0.0:
 					rate *= 0.25
 				tl["g"] = minf(1.0, tl["g"] + rate * delta)
+	_update_tiles()
+	# ตัวเลขลอย
+	var keep: Array = []
 	for f in floats:
 		f["t"] += delta
-	floats = floats.filter(func(f): return f["t"] < 1.3)
+		var l: Label3D = f["n"]
+		if f["t"] >= 1.3:
+			l.queue_free()
+			continue
+		var a: float = 1.0 - float(f["t"]) / 1.3
+		var fp: Vector3 = f["p"]
+		l.position = fp + Vector3(0, float(f["t"]) * 0.9, 0)
+		var c: Color = f["col"]
+		c.a = a
+		l.modulate = c
+		l.outline_modulate = Color(0.2, 0.1, 0.05, a)
+		keep.append(f)
+	floats = keep
+	# ไฮไลต์แปลง
+	if _in_land(hover):
+		hover_mesh.visible = true
+		hover_mesh.position = Vector3(hover.x - CENTER, 0.17, hover.y - CENTER)
+	else:
+		hover_mesh.visible = false
+	# ผู้ซื้อ
+	for id in buyer_nodes:
+		var e: Dictionary = buyer_nodes[id]
+		var n: Node3D = e["node"]
+		var b: Dictionary = e["b"]
+		var tp: Vector3 = e["target"]
+		n.position.x = move_toward(n.position.x, tp.x, 4.0 * delta)
+		n.position.z = tp.z
+		n.position.y = absf(sin(t * 3.0 + float(id))) * 0.03
+		var urgent: bool = b["patience"] < 10.0
+		n.rotation.z = sin(t * 28.0) * 0.06 if urgent else 0.0
 	for e in bar_refs:
-		var b: Dictionary = e[1]
-		e[0].value = b["patience"]
+		var bb: Dictionary = e[1]
+		e[0].value = bb["patience"]
 	day_bar.value = Eco.day_time
+	# ไก่เดินเล่น
+	for c in chickens:
+		var cn: Node3D = c["n"]
+		c["wait"] -= delta
+		if c["wait"] > 0.0:
+			continue
+		var tg: Vector3 = c["target"]
+		var d := tg - cn.position
+		d.y = 0.0
+		if d.length() < 0.08:
+			c["wait"] = randf_range(1.0, 3.5)
+			c["target"] = Vector3(randf_range(-9.0, -5.4), 0.0, randf_range(-3.0, -0.4))
+		else:
+			var dn := d.normalized()
+			cn.position += dn * 0.6 * delta
+			cn.rotation.y = atan2(dn.x, dn.z)
+			cn.position.y = absf(sin(t * 14.0)) * 0.04
+	# กลางวัน-กลางคืน
+	var p: float = Eco.day_time / Eco.DAY_LENGTH
+	var night := 0.0
+	if p > 0.8:
+		night = (p - 0.8) / 0.2
+	elif p < 0.06:
+		night = (0.06 - p) / 0.06
+	night = clampf(night, 0.0, 1.0)
+	var dusk := clampf((p - 0.62) / 0.18, 0.0, 1.0) * (1.0 - night)
+	sun.light_energy = lerpf(1.1, 0.35, night)
+	sun.light_color = Color("fff1d6").lerp(Color("ffb070"), dusk).lerp(Color("8fa6ff"), night)
+	env.ambient_light_energy = lerpf(0.6, 0.45, night)
+	env.ambient_light_color = Color("dfe9ff").lerp(Color("ffd9b0"), dusk).lerp(Color("5a6ab0"), night)
+	env.background_color = Color("9fdcff").lerp(Color("1a2250"), night)
 	_sync_t += delta
 	if _sync_t > 3.0:
 		_sync_t = 0.0
 		_sync_tiles()
-	queue_redraw()
 
 # =====================================================================
-#  วาดภาพ
+#  ตัวช่วยสร้างโมเดล
 # =====================================================================
+func M(col: Color) -> StandardMaterial3D:
+	var k := col.to_html()
+	if not _mats.has(k):
+		var m := StandardMaterial3D.new()
+		m.albedo_color = col
+		m.roughness = 0.85
+		_mats[k] = m
+	return _mats[k]
+
+func _mi(parent: Node, mesh: Mesh, pos: Vector3, col: Color) -> MeshInstance3D:
+	var mi := MeshInstance3D.new()
+	mi.mesh = mesh
+	mi.material_override = M(col)
+	mi.position = pos
+	parent.add_child(mi)
+	return mi
+
+func box(parent: Node, size: Vector3, pos: Vector3, col: Color) -> MeshInstance3D:
+	var m := BoxMesh.new()
+	m.size = size
+	return _mi(parent, m, pos, col)
+
+func ball(parent: Node, r: float, pos: Vector3, col: Color, squash: float = 1.0) -> MeshInstance3D:
+	var m := SphereMesh.new()
+	m.radius = r
+	m.height = r * 2.0 * squash
+	m.radial_segments = 14
+	m.rings = 7
+	return _mi(parent, m, pos, col)
+
+func cyl(parent: Node, rt: float, rb: float, h: float, pos: Vector3, col: Color) -> MeshInstance3D:
+	var m := CylinderMesh.new()
+	m.top_radius = rt
+	m.bottom_radius = rb
+	m.height = h
+	m.radial_segments = 12
+	m.rings = 1
+	return _mi(parent, m, pos, col)
+
+func prism(parent: Node, size: Vector3, pos: Vector3, col: Color) -> MeshInstance3D:
+	var m := PrismMesh.new()
+	m.size = size
+	return _mi(parent, m, pos, col)
+
+func capsule(parent: Node, r: float, h: float, pos: Vector3, col: Color) -> MeshInstance3D:
+	var m := CapsuleMesh.new()
+	m.radius = r
+	m.height = maxf(h, r * 2.0)
+	m.radial_segments = 10
+	m.rings = 4
+	return _mi(parent, m, pos, col)
+
+func label3d(parent: Node, txt: String, pos: Vector3, size: int, col: Color, px: float = 0.01) -> Label3D:
+	var l := Label3D.new()
+	l.text = txt
+	l.font = font
+	l.font_size = size
+	l.pixel_size = px
+	l.outline_size = 14
+	l.outline_modulate = Color(0.2, 0.1, 0.05, 1.0)
+	l.modulate = col
+	l.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+	l.no_depth_test = true
+	l.position = pos
+	parent.add_child(l)
+	return l
+
 func _h(x: int, y: int) -> int:
 	return absi((x * 73856093) ^ (y * 19349663)) % 1000
 
-func _ell(c: Vector2, rx: float, ry: float, col: Color) -> void:
-	var pts := PackedVector2Array()
-	for i in 28:
-		var a := TAU * i / 28.0
-		pts.append(c + Vector2(cos(a) * rx, sin(a) * ry))
-	draw_colored_polygon(pts, col)
+# =====================================================================
+#  สร้างโลก 3D
+# =====================================================================
+func _build_world() -> void:
+	env = Environment.new()
+	env.background_mode = Environment.BG_COLOR
+	env.background_color = Color("9fdcff")
+	env.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
+	env.ambient_light_color = Color("dfe9ff")
+	env.ambient_light_energy = 0.6
+	var we := WorldEnvironment.new()
+	we.environment = env
+	add_child(we)
 
-func _txt(p: Vector2, s: String, size: int, col: Color, w: float = 200.0) -> void:
-	draw_string_outline(font, Vector2(p.x - w / 2.0, p.y), s, HORIZONTAL_ALIGNMENT_CENTER, w, size, 6, Color(0.2, 0.1, 0.05, 0.9))
-	draw_string(font, Vector2(p.x - w / 2.0, p.y), s, HORIZONTAL_ALIGNMENT_CENTER, w, size, col)
+	sun = DirectionalLight3D.new()
+	sun.rotation_degrees = Vector3(-52.0, -35.0, 0.0)
+	sun.light_energy = 1.1
+	sun.light_color = Color("fff1d6")
+	sun.shadow_enabled = true
+	sun.directional_shadow_mode = DirectionalLight3D.SHADOW_ORTHOGONAL
+	sun.directional_shadow_max_distance = 45.0
+	add_child(sun)
 
-func _draw() -> void:
-	_draw_background()
-	_draw_far_things()
-	_draw_tiles()
-	_draw_stall()
-	_draw_buyers()
-	for p in [Vector2(330, 585), Vector2(190, 560), Vector2(40, 500), Vector2(850, 560)]:
-		_tree(p, 1.1)
-	_draw_floats()
-	_draw_daylight()
+	cam = Camera3D.new()
+	cam.fov = 40.0
+	cam.near = 0.5
+	cam.far = 220.0
+	var pitch := deg_to_rad(48.0)
+	cam.position = Vector3(0.0, sin(pitch), cos(pitch)) * 23.0 + Vector3(4.9, 0.0, 0.0) + Vector3(0.0, -cos(pitch), sin(pitch)) * 0.47
+	cam.rotation_degrees = Vector3(-48.0, 0.0, 0.0)
+	add_child(cam)
+	cam.current = true
 
-func _draw_background() -> void:
-	draw_rect(Rect2(0, 0, 1280, 720), Color("8bd450"))
-	draw_rect(Rect2(0, 0, 1280, 100), Color("9fdcff"))
-	draw_rect(Rect2(0, 62, 1280, 38), Color("c4ecff"))
-	_ell(Vector2(160, 104), 300, 42, Color("6fc03f"))
-	_ell(Vector2(720, 108), 380, 46, Color("7acb45"))
-	_ell(Vector2(1180, 104), 300, 42, Color("6fc03f"))
-	draw_rect(Rect2(0, 104, 1280, 616), Color("8bd450"))
-	# ก้อนเมฆลอย
-	for k in 4:
-		var cx := fmod(t * 12.0 + k * 360.0, 1500.0) - 120.0
-		var cy := 28.0 + (k % 2) * 26.0
-		_ell(Vector2(cx, cy), 46, 15, Color(1, 1, 1, 0.95))
-		_ell(Vector2(cx + 28, cy - 9), 30, 14, Color(1, 1, 1, 0.95))
-		_ell(Vector2(cx - 26, cy - 5), 26, 12, Color(1, 1, 1, 0.95))
-	# กระจุกหญ้า
-	for i in 70:
-		var gx := float((i * 197) % 1280)
-		var gy := 120.0 + float((i * 331) % 480)
-		draw_line(Vector2(gx, gy), Vector2(gx - 3, gy - 7), Color("6bbf3a"), 2)
-		draw_line(Vector2(gx, gy), Vector2(gx + 3, gy - 8), Color("6bbf3a"), 2)
+	var gm := PlaneMesh.new()
+	gm.size = Vector2(180.0, 180.0)
+	var ground := _mi(self, gm, Vector3.ZERO, Color("7ec850"))
+	ground.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 
-func _draw_far_things() -> void:
-	# บ่อน้ำ
-	var pc := Vector2(150, 430)
-	_ell(pc + Vector2(0, 5), 78, 32, Color("5aa83a"))
-	_ell(pc, 70, 27, Color("7fd6ff"))
-	_ell(pc + Vector2(-8, -3), 52, 18, Color("5cc3f2"))
-	draw_arc(pc + Vector2(-20, 2), 10, 0, TAU, 20, Color(1, 1, 1, 0.6), 2)
-	_ell(pc + Vector2(30, 6), 9, 4, Color("3fae4a"))
-	# โรงนา + ไซโล
-	var b := Vector2(170, 172)
-	_ell(b + Vector2(20, 44), 100, 14, Color(0, 0, 0, 0.15))
-	draw_rect(Rect2(b.x + 62, b.y - 40, 30, 82), Color("c9ced6"))
-	draw_rect(Rect2(b.x + 62, b.y - 40, 8, 82), Color("e4e8ee"))
-	draw_colored_polygon(PackedVector2Array([Vector2(b.x + 58, b.y - 40), Vector2(b.x + 77, b.y - 62), Vector2(b.x + 96, b.y - 40)]), Color("8e97a4"))
-	draw_rect(Rect2(b.x - 55, b.y - 30, 110, 72), Color("d6382c"))
-	draw_rect(Rect2(b.x - 55, b.y - 30, 110, 6), Color("f26b5e"))
-	draw_colored_polygon(PackedVector2Array([Vector2(b.x - 66, b.y - 28), Vector2(b.x, b.y - 88), Vector2(b.x + 66, b.y - 28)]), Color("9e2a22"))
-	draw_colored_polygon(PackedVector2Array([Vector2(b.x - 56, b.y - 30), Vector2(b.x, b.y - 80), Vector2(b.x + 56, b.y - 30)]), Color("d6382c"))
-	_ell(Vector2(b.x, b.y - 48), 9, 9, Color("fff3d6"))
-	draw_rect(Rect2(b.x - 20, b.y + 2, 40, 40), Color("8a1f19"))
-	draw_rect(Rect2(b.x - 20, b.y + 2, 40, 40), Color("fff3d6"), false, 3)
-	draw_line(Vector2(b.x - 20, b.y + 2), Vector2(b.x + 20, b.y + 42), Color("fff3d6"), 3)
-	draw_line(Vector2(b.x + 20, b.y + 2), Vector2(b.x - 20, b.y + 42), Color("fff3d6"), 3)
-	# ต้นไม้ไกลๆ
-	for p in [Vector2(45, 200), Vector2(75, 330), Vector2(300, 150), Vector2(860, 190), Vector2(30, 120)]:
-		_tree(p, 1.0)
+	# หญ้าและดอกไม้กระจาย
+	var tuft := CylinderMesh.new()
+	tuft.top_radius = 0.0
+	tuft.bottom_radius = 0.09
+	tuft.height = 0.32
+	tuft.radial_segments = 5
+	tuft.rings = 1
+	_scatter(tuft, Color("5fb040"), 260, 11, 0.14, 1.0)
+	var fl := SphereMesh.new()
+	fl.radius = 0.07
+	fl.height = 0.14
+	fl.radial_segments = 6
+	fl.rings = 3
+	_scatter(fl, Color("fff3a0"), 40, 21, 0.1, 1.0)
+	_scatter(fl, Color("ffb3d9"), 40, 22, 0.1, 1.0)
+	_scatter(fl, Color("ffffff"), 30, 23, 0.1, 1.0)
 
-func _tree(base: Vector2, s: float) -> void:
-	_ell(base + Vector2(0, 2), 22 * s, 7 * s, Color(0, 0, 0, 0.18))
-	draw_rect(Rect2(base.x - 5 * s, base.y - 26 * s, 10 * s, 26 * s), Color("8a5a2b"))
-	_ell(base + Vector2(0, -42) * s, 24 * s, 21 * s, Color("2f9d3a"))
-	_ell(base + Vector2(-15, -30) * s, 17 * s, 15 * s, Color("2a8f35"))
-	_ell(base + Vector2(15, -30) * s, 17 * s, 15 * s, Color("2a8f35"))
-	_ell(base + Vector2(-6, -50) * s, 13 * s, 11 * s, Color("55c85a"))
-	draw_circle(base + Vector2(8, -38) * s, 3 * s, Color("e8334a"))
-	draw_circle(base + Vector2(-12, -28) * s, 3 * s, Color("e8334a"))
+	hover_mesh = box(self, Vector3(0.98, 0.03, 0.98), Vector3.ZERO, Color.WHITE)
+	var hm := StandardMaterial3D.new()
+	hm.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	hm.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	hm.albedo_color = Color(1, 1, 1, 0.38)
+	hover_mesh.material_override = hm
+	hover_mesh.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	hover_mesh.visible = false
 
-func _bush(base: Vector2, s: float) -> void:
-	_ell(base + Vector2(0, 2), 16 * s, 5 * s, Color(0, 0, 0, 0.15))
-	_ell(base + Vector2(-8, -6) * s, 11 * s, 9 * s, Color("2a8f35"))
-	_ell(base + Vector2(8, -6) * s, 11 * s, 9 * s, Color("2a8f35"))
-	_ell(base + Vector2(0, -11) * s, 11 * s, 9 * s, Color("48b84f"))
+	_build_tiles()
+	_build_fence()
+	_build_barn(Vector3(-6.6, 0.0, -4.9))
+	_build_pond(Vector3(-6.9, 0.0, 1.9))
+	_build_stall(Vector3(7.2, 0.0, 0.8))
+	_build_path()
+	for tp in [Vector3(-9.5, 0, -1.0), Vector3(-9.2, 0, 4.2), Vector3(-3.5, 0, 6.8), Vector3(3.0, 0, 7.4),
+			Vector3(9.4, 0, 5.4), Vector3(10.5, 0, -2.5), Vector3(-1.5, 0, -7.4), Vector3(4.5, 0, -7.2),
+			Vector3(9.0, 0, -6.5), Vector3(-10.4, 0, -6.0)]:
+		_make_tree(self, tp, 1.0 + float(int(absf(tp.x * 3.0 + tp.z)) % 4) * 0.07)
+	for bp in [Vector3(-4.6, 0, 6.0), Vector3(6.0, 0, 6.6), Vector3(-8.4, 0, -2.3), Vector3(10.0, 0, 2.6)]:
+		_make_bush(self, bp)
+	for i in 3:
+		var ch := _make_chicken(Vector3(-8.0 + i * 0.8, 0.0, -1.8))
+		chickens.append({"n": ch, "wait": randf_range(0.5, 2.5), "target": ch.position})
 
-func _draw_tiles() -> void:
-	var n := Eco.land_size()
-	var hw := TW / 2.0
-	var hh := TH / 2.0
-	for s in range(2 * MAXN - 1):
-		for x in range(maxi(0, s - MAXN + 1), mini(s, MAXN - 1) + 1):
-			var y := s - x
-			var c := tile_center(x, y)
-			var unlocked := x < n and y < n
+func _scatter(mesh: Mesh, col: Color, n: int, seed_v: int, y: float, sc: float) -> void:
+	var rng := RandomNumberGenerator.new()
+	rng.seed = seed_v
+	var mm := MultiMesh.new()
+	mm.transform_format = MultiMesh.TRANSFORM_3D
+	mm.mesh = mesh
+	mm.instance_count = n
+	for i in n:
+		var p := Vector3(rng.randf_range(-18.0, 18.0), y, rng.randf_range(-13.0, 16.0))
+		if absf(p.x) < 5.4 and absf(p.z) < 5.4:
+			p.x = (1.0 if p.x >= 0.0 else -1.0) * rng.randf_range(5.6, 18.0)
+		var b := Basis().scaled(Vector3.ONE * sc * rng.randf_range(0.7, 1.3))
+		mm.set_instance_transform(i, Transform3D(b, p))
+	var mmi := MultiMeshInstance3D.new()
+	mmi.multimesh = mm
+	mmi.material_override = M(col)
+	mmi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	add_child(mmi)
+
+func _build_tiles() -> void:
+	tile_nodes.clear()
+	var gold := StandardMaterial3D.new()
+	gold.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	gold.albedo_color = Color("ffe35a")
+	for y in MAXN:
+		var row: Array = []
+		for x in MAXN:
+			var root := Node3D.new()
+			root.position = Vector3(x - CENTER, 0.0, y - CENTER)
+			add_child(root)
+			var gcol := Color("90da62") if (x + y) % 2 == 0 else Color("86d058")
+			var base := box(root, Vector3(0.97, 0.08, 0.97), Vector3(0, 0.04, 0), gcol)
+			var soil := Node3D.new()
+			root.add_child(soil)
+			var soil_box := box(soil, Vector3(0.97, 0.15, 0.97), Vector3(0, 0.075, 0), Color("9a6532"))
+			var furrows: Array = []
+			for fx in [-0.28, 0.0, 0.28]:
+				furrows.append(box(soil, Vector3(0.14, 0.03, 0.84), Vector3(fx, 0.15, 0), Color("7b4d25")))
+			var cropn := Node3D.new()
+			root.add_child(cropn)
+			var ready := ball(root, 0.11, Vector3(0, 1.5, 0), Color("ffe35a"))
+			ready.material_override = gold
+			ready.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+			var decor := Node3D.new()
+			root.add_child(decor)
+			_build_decor(decor, _h(x, y))
+			row.append({"root": root, "base": base, "soil": soil, "soil_box": soil_box, "furrows": furrows,
+				"crop": cropn, "ready": ready, "decor": decor, "sig": -1})
+		tile_nodes.append(row)
+
+func _build_decor(parent: Node3D, hv: int) -> void:
+	match hv % 5:
+		0:
+			_make_tree(parent, Vector3.ZERO, 0.8 + float(hv % 7) * 0.05)
+		1:
+			_make_bush(parent, Vector3.ZERO)
+		2:
+			for i in 4:
+				var ox := float((hv * 7 + i * 31) % 60) / 100.0 - 0.3
+				var oz := float((hv * 11 + i * 17) % 60) / 100.0 - 0.3
+				var fc: Color = [Color("fff3a0"), Color("ffb3d9"), Color("ffffff"), Color("c9a0ff")][(hv + i) % 4]
+				cyl(parent, 0.012, 0.012, 0.2, Vector3(ox, 0.1, oz), Color("3fae4a"))
+				ball(parent, 0.065, Vector3(ox, 0.22, oz), fc)
+		3:
+			if hv % 2 == 0:
+				var r := ball(parent, 0.3, Vector3(0, 0.15, 0), Color("8d9096"), 0.7)
+				r.rotation_degrees = Vector3(0, hv % 90, 0)
+				ball(parent, 0.18, Vector3(0.28, 0.1, 0.1), Color("a3a7ad"), 0.7)
+
+func _make_tree(parent: Node, pos: Vector3, s: float) -> void:
+	var n := Node3D.new()
+	n.position = pos
+	n.scale = Vector3.ONE * s
+	cyl(n, 0.14, 0.2, 1.1, Vector3(0, 0.55, 0), Color("8a5a2b"))
+	ball(n, 0.85, Vector3(0, 1.6, 0), Color("2f9d3a"), 0.9)
+	ball(n, 0.65, Vector3(-0.35, 2.05, 0.1), Color("3fae4a"))
+	ball(n, 0.55, Vector3(0.35, 2.2, -0.1), Color("55c85a"))
+	for a in [Vector3(0.5, 1.6, 0.7), Vector3(-0.6, 1.9, 0.5), Vector3(0.1, 2.45, 0.45)]:
+		ball(n, 0.08, a, Color("e8334a"))
+	parent.add_child(n)
+
+func _make_bush(parent: Node, pos: Vector3) -> void:
+	var n := Node3D.new()
+	n.position = pos
+	ball(n, 0.36, Vector3(0, 0.26, 0), Color("2f9d3a"), 0.85)
+	ball(n, 0.28, Vector3(0.28, 0.22, 0.1), Color("3fae4a"), 0.85)
+	ball(n, 0.26, Vector3(-0.26, 0.2, -0.05), Color("55c85a"), 0.85)
+	ball(n, 0.05, Vector3(0.1, 0.4, 0.3), Color("e8334a"))
+	ball(n, 0.05, Vector3(-0.3, 0.32, 0.15), Color("e8334a"))
+	parent.add_child(n)
+
+func _build_fence() -> void:
+	var e := 4.75
+	var wood := Color("c9904f")
+	var dark := Color("8a5a2b")
+	var steps := 10
+	for i in range(steps + 1):
+		var v := -e + float(i) * (2.0 * e / float(steps))
+		box(self, Vector3(0.12, 0.5, 0.12), Vector3(v, 0.25, -e), dark)
+		box(self, Vector3(0.12, 0.5, 0.12), Vector3(-e, 0.25, v), dark)
+		box(self, Vector3(0.12, 0.5, 0.12), Vector3(e, 0.25, v), dark)
+	for yy in [0.2, 0.38]:
+		box(self, Vector3(2.0 * e, 0.07, 0.05), Vector3(0, yy, -e), wood)
+		box(self, Vector3(0.05, 0.07, 2.0 * e), Vector3(-e, yy, 0), wood)
+		box(self, Vector3(0.05, 0.07, 2.0 * e), Vector3(e, yy, 0), wood)
+
+func _build_path() -> void:
+	var sand := Color("d8b878")
+	var pm := box(self, Vector3(3.2, 0.03, 1.6), Vector3(5.2, 0.015, 1.9), sand)
+	pm.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	var pm2 := box(self, Vector3(1.6, 0.03, 3.4), Vector3(-6.6, 0.015, -2.0), sand)
+	pm2.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+
+func _build_barn(pos: Vector3) -> void:
+	var n := Node3D.new()
+	n.position = pos
+	add_child(n)
+	var red := Color("c4382c")
+	var white := Color("f3ead2")
+	box(n, Vector3(3.2, 2.0, 2.6), Vector3(0, 1.0, 0), red)
+	box(n, Vector3(3.24, 0.12, 2.64), Vector3(0, 0.06, 0), Color("8b8478"))
+	for sx in [-1.6, 1.6]:
+		box(n, Vector3(0.1, 2.0, 2.66), Vector3(sx, 1.0, 0), white)
+	var roof := prism(n, Vector3(3.7, 1.5, 2.9), Vector3(0, 2.75, 0), Color("8f2a21"))
+	roof.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
+	prism(n, Vector3(3.2, 1.1, 2.62), Vector3(0, 2.5, 0), red)
+	box(n, Vector3(1.1, 1.35, 0.08), Vector3(0, 0.68, 1.32), Color("7c2019"))
+	for rz in [45.0, -45.0]:
+		var xb := box(n, Vector3(1.55, 0.08, 0.06), Vector3(0, 0.68, 1.38), white)
+		xb.rotation_degrees = Vector3(0, 0, rz)
+	box(n, Vector3(1.2, 0.08, 0.06), Vector3(0, 1.36, 1.38), white)
+	box(n, Vector3(0.08, 1.35, 0.06), Vector3(-0.58, 0.68, 1.38), white)
+	box(n, Vector3(0.08, 1.35, 0.06), Vector3(0.58, 0.68, 1.38), white)
+	box(n, Vector3(0.5, 0.5, 0.06), Vector3(0, 2.2, 1.33), Color("3a1a14"))
+	box(n, Vector3(0.6, 0.06, 0.08), Vector3(0, 2.2, 1.37), white)
+	box(n, Vector3(0.06, 0.6, 0.08), Vector3(0, 2.2, 1.37), white)
+	# ไซโล
+	var sp := Vector3(-2.3, 0.0, 0.1)
+	cyl(n, 0.62, 0.62, 3.4, sp + Vector3(0, 1.7, 0), Color("c9ced6"))
+	for hy in [0.7, 1.5, 2.3]:
+		cyl(n, 0.64, 0.64, 0.06, sp + Vector3(0, hy, 0), Color("8e97a4"))
+	cyl(n, 0.0, 0.76, 0.8, sp + Vector3(0, 3.8, 0), Color("8e97a4"))
+	# กองฟาง
+	for i in 2:
+		var hb := cyl(n, 0.4, 0.4, 0.55, Vector3(2.3 + i * 0.5, 0.28, 1.5 - i * 0.25), Color("e4c15a"))
+		hb.rotation_degrees = Vector3(0, 0, 90.0)
+
+func _build_pond(pos: Vector3) -> void:
+	var n := Node3D.new()
+	n.position = pos
+	add_child(n)
+	var sand := cyl(n, 2.2, 2.2, 0.06, Vector3(0, 0.03, 0), Color("d8c28a"))
+	sand.scale = Vector3(1.0, 1.0, 0.72)
+	var w := cyl(n, 1.95, 1.95, 0.08, Vector3(0, 0.05, 0), Color("3f9ad8"))
+	w.scale = Vector3(1.0, 1.0, 0.72)
+	var wm := StandardMaterial3D.new()
+	wm.albedo_color = Color("48a6e6")
+	wm.roughness = 0.12
+	wm.metallic = 0.25
+	w.material_override = wm
+	for lp in [Vector3(0.6, 0.1, 0.2), Vector3(-0.8, 0.1, -0.2), Vector3(0.1, 0.1, 0.6)]:
+		cyl(n, 0.3, 0.3, 0.02, lp, Color("3fae4a"))
+		ball(n, 0.05, lp + Vector3(0.05, 0.05, 0), Color("f7a8c8"))
+	for cp in [Vector3(-2.0, 0, 0.5), Vector3(1.9, 0, -0.4), Vector3(-1.2, 0, 1.2)]:
+		cyl(n, 0.02, 0.02, 0.8, cp + Vector3(0, 0.4, 0), Color("4aa63f"))
+		cyl(n, 0.05, 0.05, 0.22, cp + Vector3(0, 0.85, 0), Color("6b4423"))
+	for rp in [Vector3(1.8, 0.1, 1.0), Vector3(-1.9, 0.1, -0.9)]:
+		ball(n, 0.22, rp, Color("8d9096"), 0.7)
+
+func _build_stall(pos: Vector3) -> void:
+	var n := Node3D.new()
+	n.position = pos
+	add_child(n)
+	var wood := Color("c28a4b")
+	var dark := Color("8a5a2b")
+	box(n, Vector3(2.4, 0.75, 0.95), Vector3(0, 0.38, 0), wood)
+	box(n, Vector3(2.5, 0.08, 1.05), Vector3(0, 0.78, 0), Color("e0b070"))
+	for i in 5:
+		box(n, Vector3(0.04, 0.7, 0.02), Vector3(-0.9 + i * 0.45, 0.38, 0.49), dark)
+	for sx in [-1.15, 1.15]:
+		box(n, Vector3(0.1, 2.0, 0.1), Vector3(sx, 1.0, -0.4), dark)
+		box(n, Vector3(0.1, 1.7, 0.1), Vector3(sx, 0.85, 0.45), dark)
+	for i in 6:
+		var col := Color("d9263f") if i % 2 == 0 else Color("f7efdc")
+		var aw := box(n, Vector3(0.43, 0.07, 1.6), Vector3(-1.08 + i * 0.43, 1.85, 0.05), col)
+		aw.rotation_degrees = Vector3(14, 0, 0)
+	for fi in 5:
+		var fc: Color = [Color("d9263f"), Color("f2831f"), Color("f5d63a"), Color("7fae3a"), Color("f08a1c")][fi]
+		ball(n, 0.17, Vector3(-0.95 + fi * 0.48, 0.99, 0.05), fc)
+	var crate := box(n, Vector3(0.5, 0.35, 0.5), Vector3(-1.7, 0.18, 0.5), Color("b07a3e"))
+	crate.rotation_degrees = Vector3(0, 15, 0)
+	ball(n, 0.15, Vector3(-1.7, 0.45, 0.5), Color("e8334a"))
+	label3d(n, "ตลาด", Vector3(0, 2.6, 0.2), 52, Color("fff3d6"), 0.012)
+
+func _make_chicken(pos: Vector3) -> Node3D:
+	var n := Node3D.new()
+	n.position = pos
+	ball(n, 0.16, Vector3(0, 0.2, 0), Color("fafafa"), 0.85)
+	ball(n, 0.1, Vector3(0, 0.38, 0.12), Color("fafafa"))
+	box(n, Vector3(0.03, 0.07, 0.06), Vector3(0, 0.48, 0.12), Color("e8334a"))
+	box(n, Vector3(0.04, 0.03, 0.07), Vector3(0, 0.37, 0.2), Color("f2a31f"))
+	ball(n, 0.1, Vector3(0, 0.27, -0.15), Color("e6e6e6"), 0.8)
+	box(n, Vector3(0.02, 0.1, 0.02), Vector3(-0.05, 0.05, 0), Color("f2a31f"))
+	box(n, Vector3(0.02, 0.1, 0.02), Vector3(0.05, 0.05, 0), Color("f2a31f"))
+	add_child(n)
+	return n
+
+# =====================================================================
+#  อัปเดตแปลง / พืช
+# =====================================================================
+func _update_tiles() -> void:
+	var land := Eco.land_size()
+	for y in MAXN:
+		for x in MAXN:
 			var tl: Dictionary = tiles[y][x]
-			var top: Color
-			if not unlocked:
-				top = Color("63b23a") if (x + y) % 2 == 0 else Color("5aa834")
-			elif tl["s"] == 0:
-				top = Color("9be05a") if (x + y) % 2 == 0 else Color("8fd44f")
-			else:
-				top = Color("6e4523") if tl["w"] > 0.0 else Color("9a6532")
-			var side := top.darkened(0.38)
-			if unlocked and tl["s"] >= 1:
-				side = Color("5e3b1c")
-			# ขอบหนา
-			draw_colored_polygon(PackedVector2Array([c + Vector2(-hw, 0), c + Vector2(0, hh), c + Vector2(0, hh + 9), c + Vector2(-hw, 9)]), side)
-			draw_colored_polygon(PackedVector2Array([c + Vector2(hw, 0), c + Vector2(0, hh), c + Vector2(0, hh + 9), c + Vector2(hw, 9)]), side.darkened(0.15))
-			var dia := PackedVector2Array([c + Vector2(0, -hh), c + Vector2(hw, 0), c + Vector2(0, hh), c + Vector2(-hw, 0)])
-			draw_colored_polygon(dia, top)
-			var outline := top.darkened(0.2)
-			outline.a = 0.8
-			draw_polyline(PackedVector2Array([dia[0], dia[1], dia[2], dia[3], dia[0]]), outline, 1.5)
-			if not unlocked:
-				var hv := _h(x, y)
-				if hv % 4 == 0:
-					_tree(c + Vector2(0, 8), 0.8)
-				elif hv % 4 == 1:
-					_bush(c + Vector2(0, 6), 1.0)
-				continue
-			if tl["s"] == 0:
-				var hv2 := _h(x, y)
-				if hv2 % 5 == 0:
-					var fp := c + Vector2((hv2 % 31) - 15, ((hv2 / 7) % 13) - 6)
-					draw_circle(fp, 3, Color("fff3a0") if hv2 % 2 == 0 else Color("ffb3d9"))
-					draw_circle(fp, 1.2, Color("e8a21a"))
-			else:
-				var fc := top.darkened(0.22)
-				for k in [-1, 0, 1]:
-					var o := Vector2(hw, -hh) * 0.32 * k
-					draw_line(c + o + Vector2(-hw, -hh) * 0.5, c + o + Vector2(hw, hh) * 0.5, fc, 3)
+			var n: Dictionary = tile_nodes[y][x]
+			var unlocked := x < land and y < land
+			var st := -1
 			if tl["s"] == 2:
-				_draw_plants(c, tl)
-			if Vector2i(x, y) == hover:
-				var hl := PackedVector2Array([dia[0], dia[1], dia[2], dia[3], dia[0]])
-				draw_polyline(hl, Color(1, 1, 1, 0.9), 3)
+				st = 4 if tl["g"] >= 1.0 else mini(int(float(tl["g"]) * 4.0), 3)
+			var wet: bool = tl["w"] > 0.0
+			var sig: int = (1 if unlocked else 0) + int(tl["s"]) * 2 + (st + 1) * 8 + (128 if wet else 0) + int(CIDX.get(tl["c"], 0)) * 256
+			if sig != n["sig"]:
+				n["sig"] = sig
+				(n["decor"] as Node3D).visible = not unlocked
+				(n["base"] as Node3D).visible = unlocked and tl["s"] == 0
+				var soil: Node3D = n["soil"]
+				soil.visible = unlocked and tl["s"] >= 1
+				var sb: MeshInstance3D = n["soil_box"]
+				sb.material_override = M(Color("62401f") if wet else Color("9a6532"))
+				for f in n["furrows"]:
+					(f as MeshInstance3D).material_override = M(Color("4a2f16") if wet else Color("7b4d25"))
+				var cropn: Node3D = n["crop"]
+				for ch in cropn.get_children():
+					cropn.remove_child(ch)
+					ch.queue_free()
+				if st >= 0:
+					_build_crop(cropn, tl["c"], st)
+			var rd: MeshInstance3D = n["ready"]
+			rd.visible = st == 4
+			if st == 4:
+				rd.position.y = 1.55 + sin(t * 5.0 + float(x + y)) * 0.1
 
-func _draw_plants(c: Vector2, tl: Dictionary) -> void:
-	var g: float = tl["g"]
-	var k: String = tl["c"]
-	var sc := 0.35 + 0.65 * minf(g, 1.0)
-	var offs := [Vector2(0, -7), Vector2(-17, 3), Vector2(17, 3), Vector2(0, 10)]
-	for o in offs:
-		_plant(c + o, k, sc, g)
-	if g >= 1.0:
-		var bob := sin(t * 5.0) * 3.0
-		var sp := c + Vector2(0, -34 + bob)
-		draw_circle(sp, 7, Color("fff7a8"))
-		draw_circle(sp, 7, Color("e8a21a"), false, 2)
-		draw_line(sp + Vector2(0, -3), sp + Vector2(0, 3), Color("e8a21a"), 2)
-
-func _plant(b: Vector2, k: String, s: float, g: float) -> void:
-	var green := Color("3fae4a")
+func _build_crop(parent: Node3D, k: String, st: int) -> void:
+	var spots := [Vector3(-0.22, 0, -0.22), Vector3(0.22, 0, -0.22), Vector3(-0.22, 0, 0.22), Vector3(0.22, 0, 0.22)]
+	var yb := 0.15
 	match k:
 		"wheat":
-			for dx in [-4, 0, 4]:
-				var top := b + Vector2(dx * s, -22 * s)
-				draw_line(b + Vector2(dx * 0.5, 0), top, Color("a8c64a"), 2)
-				if g > 0.55:
-					_ell(top, 3 * s + 1, 5 * s + 1, Color("e8c547"))
+			var h: float = [0.12, 0.3, 0.5, 0.65, 0.78][st]
+			var cols := [Color("6cc04a"), Color("6cc04a"), Color("a2c64a"), Color("cbb844"), Color("e8c547")]
+			for s in spots:
+				cyl(parent, 0.03, 0.08, h, s + Vector3(0, yb + h * 0.5, 0), cols[st])
+				if st >= 3:
+					ball(parent, 0.07, s + Vector3(0, yb + h + 0.03, 0), Color("f0c93c"), 1.9)
 		"carrot":
-			for a in [-0.5, 0.0, 0.5]:
-				draw_line(b, b + Vector2(sin(a), -cos(a)) * 17 * s, green, 3)
-			if g > 0.7:
-				draw_circle(b + Vector2(0, 1), 5 * s, Color("ff8c1a"))
+			var lh: float = [0.06, 0.16, 0.24, 0.32, 0.38][st]
+			for s in spots:
+				cyl(parent, 0.0, 0.11, lh, s + Vector3(0, yb + lh * 0.5, 0), Color("4aa63f"))
+				if st >= 2:
+					var lf := cyl(parent, 0.0, 0.08, lh * 0.8, s + Vector3(0.07, yb + lh * 0.4, 0.03), Color("78d05a"))
+					lf.rotation_degrees = Vector3(0, 0, -20)
+				if st == 4:
+					cyl(parent, 0.09, 0.0, 0.2, s + Vector3(0, yb - 0.01, 0), Color("f2831f"))
 		"strawberry":
-			_ell(b + Vector2(0, -6 * s), 10 * s, 8 * s, Color("2f9d3a"))
-			_ell(b + Vector2(-3, -9 * s), 6 * s, 5 * s, Color("55c85a"))
-			if g > 0.5 and g < 1.0:
-				draw_circle(b + Vector2(4, -8 * s), 2, Color.WHITE)
-			if g >= 1.0:
-				draw_circle(b + Vector2(-5, -4), 3.5, Color("e8334a"))
-				draw_circle(b + Vector2(5, -8), 3.5, Color("e8334a"))
-				draw_circle(b + Vector2(1, -2), 3.5, Color("e8334a"))
+			var r: float = [0.05, 0.09, 0.12, 0.14, 0.15][st]
+			for s in spots:
+				ball(parent, r, s + Vector3(0, yb + r * 0.5, 0), Color("2f9d3a"), 0.75)
+				ball(parent, r * 0.7, s + Vector3(r * 0.5, yb + r * 0.9, 0), Color("55c85a"), 0.75)
+				if st == 3:
+					ball(parent, 0.03, s + Vector3(0, yb + r * 1.1, r * 0.4), Color.WHITE)
+				if st == 4:
+					ball(parent, 0.055, s + Vector3(r * 0.9, yb + r * 0.3, r * 0.6), Color("e8334a"))
+					ball(parent, 0.055, s + Vector3(-r * 0.8, yb + r * 0.35, r * 0.5), Color("e8334a"))
+					ball(parent, 0.05, s + Vector3(0.02, yb + r * 1.0, -r * 0.7), Color("ff5a6e"))
 		"corn":
-			var top2 := b + Vector2(0, -32 * s)
-			draw_line(b, top2, Color("2f9d3a"), 4)
-			draw_line(b + Vector2(0, -12 * s), b + Vector2(-9 * s, -22 * s), green, 3)
-			draw_line(b + Vector2(0, -16 * s), b + Vector2(9 * s, -26 * s), green, 3)
-			if g > 0.7:
-				_ell(b + Vector2(5 * s, -18 * s), 3.5, 7, Color("ffd93d"))
+			var h: float = [0.12, 0.4, 0.75, 1.1, 1.35][st]
+			for s in spots:
+				cyl(parent, 0.03, 0.05, h, s + Vector3(0, yb + h * 0.5, 0), Color("4aa63f"))
+				if st >= 2:
+					var l1 := box(parent, Vector3(0.3, 0.02, 0.07), s + Vector3(0.13, yb + h * 0.55, 0), Color("5cc050"))
+					l1.rotation_degrees = Vector3(0, 0, 30)
+					var l2 := box(parent, Vector3(0.3, 0.02, 0.07), s + Vector3(-0.13, yb + h * 0.4, 0), Color("4aa63f"))
+					l2.rotation_degrees = Vector3(0, 0, -30)
+				if st == 4:
+					capsule(parent, 0.05, 0.22, s + Vector3(0.07, yb + h * 0.62, 0), Color("f5d63a"))
+					box(parent, Vector3(0.18, 0.04, 0.04), s + Vector3(0, yb + h + 0.02, 0), Color("d6b844"))
 		"pumpkin":
-			draw_line(b, b + Vector2(-8 * s, -4 * s), green, 2)
-			if g > 0.5:
-				_ell(b + Vector2(0, -7 * s), 11 * s, 9 * s, Color("ff7a1a"))
-				draw_arc(b + Vector2(0, -7 * s), 6 * s, PI * 0.6, PI * 1.4, 8, Color("d85f0a"), 2)
-				draw_line(b + Vector2(0, -15 * s), b + Vector2(1, -19 * s), Color("2f9d3a"), 3)
-			else:
-				_ell(b + Vector2(0, -4 * s), 6 * s, 5 * s, green)
+			var r: float = [0.05, 0.1, 0.14, 0.2, 0.27][st]
+			var pc: Color = [Color("5fb04a"), Color("5fb04a"), Color("86b83e"), Color("e0a62e"), Color("f08a1c")][st]
+			if st >= 1:
+				for lf in [Vector3(-0.3, 0, -0.2), Vector3(0.3, 0, 0.25), Vector3(0.25, 0, -0.3)]:
+					cyl(parent, 0.14, 0.14, 0.02, lf + Vector3(0, yb + 0.02, 0), Color("3fae4a"))
+			ball(parent, r, Vector3(0, yb + r * 0.7, 0), pc, 0.8)
+			if st >= 2:
+				cyl(parent, 0.03, 0.045, 0.1, Vector3(0, yb + r * 1.4, 0), Color("2f7a33"))
 
-func _draw_stall() -> void:
-	var S := Vector2(778, 424)
-	_ell(S + Vector2(0, 36), 78, 14, Color(0, 0, 0, 0.16))
-	draw_line(S + Vector2(-54, -34), S + Vector2(-54, 28), Color("7a4a1f"), 5)
-	draw_line(S + Vector2(54, -34), S + Vector2(54, 28), Color("7a4a1f"), 5)
-	draw_rect(Rect2(S.x - 58, S.y - 4, 116, 34), Color("c98a4b"))
-	draw_rect(Rect2(S.x - 58, S.y - 4, 116, 8), Color("e0a866"))
-	draw_rect(Rect2(S.x - 58, S.y - 4, 116, 34), Color("7a4a1f"), false, 3)
-	# ของบนเคาน์เตอร์
-	draw_circle(S + Vector2(-34, -10), 9, Color("e8334a"))
-	draw_circle(S + Vector2(-18, -9), 8, Color("ff8c1a"))
-	draw_circle(S + Vector2(2, -10), 9, Color("ffd93d"))
-	draw_circle(S + Vector2(22, -10), 10, Color("ff7a1a"))
-	draw_circle(S + Vector2(40, -8), 7, Color("e8c547"))
-	# หลังคาลายทาง
-	for i in 6:
-		var x0 := S.x - 62 + i * 21.0
-		var col := Color("e8334a") if i % 2 == 0 else Color("fff3d6")
-		draw_colored_polygon(PackedVector2Array([Vector2(x0 + 4, S.y - 62), Vector2(x0 + 25, S.y - 62), Vector2(x0 + 21, S.y - 36), Vector2(x0, S.y - 36)]), col)
-		draw_circle(Vector2(x0 + 10.5, S.y - 36), 10.5, col)
-	_txt(S + Vector2(0, 21), "ตลาด", 20, Color("fff3d6"), 120)
+# =====================================================================
+#  ผู้ซื้อ 3D
+# =====================================================================
+func _make_buyer(b: Dictionary) -> Node3D:
+	var n := Node3D.new()
+	var col: Color = KIND_COL[b["kind"]]
+	var skin := Color("ffd1a1")
+	cyl(n, 0.17, 0.26, 0.78, Vector3(0, 0.42, 0), col)
+	cyl(n, 0.2, 0.2, 0.06, Vector3(0, 0.07, 0), Color("3a2418"))
+	ball(n, 0.2, Vector3(0, 1.02, 0), skin)
+	ball(n, 0.03, Vector3(-0.07, 1.05, 0.18), Color("2a1a12"))
+	ball(n, 0.03, Vector3(0.07, 1.05, 0.18), Color("2a1a12"))
+	box(n, Vector3(0.08, 0.02, 0.02), Vector3(0, 0.97, 0.2), Color("c0504d"))
+	ball(n, 0.07, Vector3(-0.27, 0.62, 0), skin)
+	ball(n, 0.07, Vector3(0.27, 0.62, 0), skin)
+	match b["kind"]:
+		"kid":
+			ball(n, 0.21, Vector3(0, 1.12, -0.01), Color("d9263f"), 0.6)
+			box(n, Vector3(0.24, 0.03, 0.14), Vector3(0, 1.12, 0.2), Color("b01c30"))
+		"chef":
+			cyl(n, 0.17, 0.17, 0.3, Vector3(0, 1.3, 0), Color("ffffff"))
+			ball(n, 0.2, Vector3(0, 1.5, 0), Color("ffffff"), 0.8)
+		"merchant":
+			cyl(n, 0.34, 0.34, 0.04, Vector3(0, 1.17, 0), Color("6b4423"))
+			cyl(n, 0.18, 0.18, 0.2, Vector3(0, 1.27, 0), Color("8a5a2b"))
+			box(n, Vector3(0.24, 0.22, 0.12), Vector3(0, 0.55, 0.22), Color("a8733a"))
+		"rich":
+			cyl(n, 0.3, 0.3, 0.03, Vector3(0, 1.17, 0), Color("1a1a1a"))
+			cyl(n, 0.17, 0.17, 0.3, Vector3(0, 1.33, 0), Color("1a1a1a"))
+			cyl(n, 0.175, 0.175, 0.05, Vector3(0, 1.24, 0), Color("f5d63a"))
+			ball(n, 0.05, Vector3(0, 0.75, 0.22), Color("f5d63a"))
+	var cd: Dictionary = Eco.CROPS[b["crop"]]
+	ball(n, 0.13, Vector3(0, 1.82, 0), CROP_COL[b["crop"]])
+	label3d(n, "%s x%d" % [cd["name"], b["qty"]], Vector3(0, 2.15, 0), 40, Color("fff7a8"), 0.008)
+	return n
 
-func _draw_buyers() -> void:
-	for i in Eco.buyers.size():
-		var b: Dictionary = Eco.buyers[i]
-		var p := Vector2(700 + i * 62, 512 + sin(t * 3.0 + i) * 2.0)
-		var urgent: bool = b["patience"] < 10.0
-		if urgent:
-			p.x += sin(t * 30.0) * 1.5
-		var col: Color = KIND_COL[b["kind"]]
-		_ell(p + Vector2(0, 18), 15, 5, Color(0, 0, 0, 0.18))
-		_ell(p + Vector2(0, 4), 13, 16, col)
-		_ell(p + Vector2(0, -2), 9, 9, col.lightened(0.2))
-		draw_circle(p + Vector2(0, -20), 11, Color("ffd1a1"))
-		draw_circle(p + Vector2(-4, -21), 1.8, Color("3b2410"))
-		draw_circle(p + Vector2(4, -21), 1.8, Color("3b2410"))
-		draw_arc(p + Vector2(0, -17), 4, 0.2, PI - 0.2, 8, Color("c0504d"), 1.5)
-		match b["kind"]:
-			"chef":
-				draw_rect(Rect2(p.x - 9, p.y - 40, 18, 12), Color.WHITE)
-				_ell(p + Vector2(0, -42), 11, 7, Color.WHITE)
-			"merchant":
-				_ell(p + Vector2(0, -29), 15, 4, Color("6b4423"))
-				draw_rect(Rect2(p.x - 9, p.y - 38, 18, 9), Color("8a5a2b"))
-			"rich":
-				draw_rect(Rect2(p.x - 14, p.y - 31, 28, 3), Color("222222"))
-				draw_rect(Rect2(p.x - 9, p.y - 46, 18, 16), Color("222222"))
-				draw_circle(p + Vector2(8, -19), 5, Color("ffd23f"), false, 1.5)
-			"kid":
-				draw_circle(p + Vector2(0, -30), 6, Color("e8334a"))
-		# ฟองคำขอ
-		var bp := p + Vector2(-28, -80)
-		draw_rect(Rect2(bp.x, bp.y, 56, 28), Color("fff9e6"))
-		draw_rect(Rect2(bp.x, bp.y, 56, 28), Color("e8334a") if urgent else Color("c98f4b"), false, 3)
-		draw_colored_polygon(PackedVector2Array([bp + Vector2(22, 28), bp + Vector2(34, 28), bp + Vector2(28, 36)]), Color("fff9e6"))
-		draw_circle(bp + Vector2(15, 14), 8, CROP_COL[b["crop"]])
-		draw_string(font, bp + Vector2(26, 20), "x%d" % b["qty"], HORIZONTAL_ALIGNMENT_LEFT, -1, 17, Color("3b2410"))
-
-func _draw_floats() -> void:
-	for f in floats:
-		var a := 1.0 - f["t"] / 1.3
-		var col: Color = f["col"]
-		col.a = a
-		var p: Vector2 = f["p"] + Vector2(0, -f["t"] * 38.0)
-		draw_string_outline(font, p - Vector2(80, 0), f["txt"], HORIZONTAL_ALIGNMENT_CENTER, 160, 20, 6, Color(0.2, 0.1, 0.05, a))
-		draw_string(font, p - Vector2(80, 0), f["txt"], HORIZONTAL_ALIGNMENT_CENTER, 160, 20, col)
-
-func _draw_daylight() -> void:
-	var p: float = Eco.day_time / Eco.DAY_LENGTH
-	var a := 0.0
-	if p > 0.8:
-		a = (p - 0.8) / 0.2 * 0.3
-	elif p < 0.06:
-		a = (0.06 - p) / 0.06 * 0.3
-	if a > 0.0:
-		draw_rect(Rect2(0, 0, 1280, 720), Color(0.1, 0.12, 0.35, a))
+func _rebuild_buyers3d() -> void:
+	var alive := {}
+	for b in Eco.buyers:
+		alive[b["id"]] = true
+	for id in buyer_nodes.keys():
+		if not alive.has(id):
+			(buyer_nodes[id]["node"] as Node3D).queue_free()
+			buyer_nodes.erase(id)
+	var i := 0
+	for b in Eco.buyers:
+		var id: int = b["id"]
+		var target := Vector3(5.8 + i * 0.95, 0.0, 2.3)
+		if not buyer_nodes.has(id):
+			var n := _make_buyer(b)
+			n.position = target + Vector3(3.5, 0.0, 0.0)
+			add_child(n)
+			buyer_nodes[id] = {"node": n, "b": b, "target": target}
+		else:
+			buyer_nodes[id]["target"] = target
+		i += 1
 
 # =====================================================================
 #  UI
